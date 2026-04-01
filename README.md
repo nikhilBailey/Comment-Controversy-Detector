@@ -5,4 +5,4 @@ A project for detecting the controversy associated with scraped youtube comments
 
 It strips the id and timestamp fields, removes commas inside the comment text, replaces emojis with `[e]` in the saved text, and uses Lingua so only longer lines must test as English (very short lines skip detection). It then drops non-ASCII characters.
 
-Install dependencies with `pip install -r requirements.txt`, then run `python3 data_annotating.py input.csv output.txt`.
+Install dependencies with `pip install -r requirements.txt`, then run `python3 data_annotating.py input.csv output.txt`. For rows that end with `,timestamp,0` or `,timestamp,1` (pre-annotated labels), use `python3 data_annotating.py input.csv output.txt -a`: row boundaries use that suffix, and each output line is `cleansed_text,0` or `cleansed_text,1`.
