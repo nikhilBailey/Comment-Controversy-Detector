@@ -1,20 +1,12 @@
-"""
-Train tabular MLP classifiers on combined feature CSV (numeric features only).
-See project plan: stratified holdout + CV, metrics, visualizations.
-"""
-
 from __future__ import annotations
-
 import argparse
 import copy
 import os
-import warnings
 from datetime import datetime
-
+from typing import Any
+import joblib
 import numpy as numpy
 import pandas as pandas
-import torch
-import torch.nn as nn
 from sklearn.metrics import (
     accuracy_score,
     f1_score,
@@ -22,13 +14,15 @@ from sklearn.metrics import (
     recall_score,
 )
 from sklearn.model_selection import StratifiedKFold, train_test_split
-from sklearn.preprocessing import StandardScaler
 
 from Model import (
-    BinaryClassifierMLP,
+    CLASSIFIER_STEP,
     LABEL_COL,
+    PCA_STEP,
     TEXT_COL,
+    ClassifierKind,
     Model,
+    build_pipeline,
     extract_feature_matrix_and_labels,
 )
 from Visualizer import Visualizer
@@ -39,8 +33,7 @@ DEFAULT_VISUALIZATIONS_ROOT_DIRECTORY = os.path.join(BASE_DIR, "visualizations")
 
 PERCENT_TEST_DATA = 0.1
 DATA_SPLIT_SEED = 42
-
-_cpu_fallback_warning_issued = False
+NUM_CV_FOLDS = 5
 
 
 def feature_columns(dataframe: pandas.DataFrame) -> list[str]:
@@ -63,9 +56,7 @@ def test_split(data: pandas.DataFrame) -> tuple[pandas.DataFrame, pandas.DataFra
 
 def cross_validation_split(
     num_folds: int,
-    training_data: pandas.DataFrame,
-) -> list[pandas.DataFrame]:
-    """each element is one validation chunk."""
+    training_data: pandas.DataFrame,) -> list[pandas.DataFrame]:
     labels = training_data[LABEL_COL].to_numpy()
     skf = StratifiedKFold(n_splits=num_folds, shuffle=True, random_state=DATA_SPLIT_SEED)
     folds: list[pandas.DataFrame] = []
@@ -74,123 +65,25 @@ def cross_validation_split(
     return folds
 
 
-def get_device() -> torch.device:
-    """
-    Prefer CUDA, then Apple MPS, else CPU.
-    Emits a warning once per process when falling back to CPU because no accelerator is available.
-    """
-    global _cpu_fallback_warning_issued
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    if not _cpu_fallback_warning_issued:
-        warnings.warn(
-            "No accelerator available (CUDA and MPS are both unavailable); using CPU.",
-            UserWarning,
-            stacklevel=2,
-        )
-        _cpu_fallback_warning_issued = True
-    return torch.device("cpu")
+def _predicted_probabilities_for_positive_class(
+    pipeline,
+    feature_matrix: numpy.ndarray,) -> numpy.ndarray:
+    classifier = pipeline.named_steps[CLASSIFIER_STEP]
+    probability_matrix = pipeline.predict_proba(feature_matrix)
+    classes = list(classifier.classes_)
+    if 1 in classes:
+        positive_class_column_index = classes.index(1)
+    else:
+        positive_class_column_index = probability_matrix.shape[1] - 1
+    return probability_matrix[:, positive_class_column_index]
 
 
-def _build_optimizer(model: Model) -> torch.optim.Optimizer:
-    assert model.classifier_model is not None
-    if model.optimization_function == "adam":
-        return torch.optim.Adam(model.classifier_model.parameters(), lr=model.learning_rate)
-    if model.optimization_function == "sgd":
-        return torch.optim.SGD(model.classifier_model.parameters(), lr=model.learning_rate)
-    raise ValueError(f"Unknown optimizer {model.optimization_function}")
-
-
-def train_model(
-    model: Model,
-    train_dataframe: pandas.DataFrame,
-    validation_dataframe: pandas.DataFrame | None,
-    feature_column_names: list[str],
-) -> None:
-    """
-    Fit scaler on train_dataframe only, train BCE-with-logits for num_epochs.
-    Appends metric dicts to model.metrics every evaluate_every epochs.
-    If validation_dataframe is None, metrics are computed on train_dataframe (for a final full-data fit).
-    """
-    if model.classifier_model is None:
-        raise ValueError("model.classifier_model must be set before train_model")
-    compute_device = get_device()
-    model.classifier_model = model.classifier_model.to(compute_device)
-    model.scaler = StandardScaler()
-    training_features, training_labels = extract_feature_matrix_and_labels(
-        train_dataframe, feature_column_names
-    )
-    scaled_training_features = model.scaler.fit_transform(training_features)
-
-    training_features_tensor = torch.tensor(
-        scaled_training_features, dtype=torch.float32, device=compute_device
-    )
-    training_labels_tensor = torch.tensor(
-        training_labels, dtype=torch.float32, device=compute_device
-    ).unsqueeze(1)
-
-    optimizer = _build_optimizer(model)
-    loss_function = nn.BCEWithLogitsLoss()
-    model.metrics.clear()
-    evaluation_dataframe = (
-        validation_dataframe if validation_dataframe is not None else train_dataframe
-    )
-
-    for epoch_index in range(1, model.num_epochs + 1):
-        model.classifier_model.train()
-        optimizer.zero_grad()
-        prediction_logits = model.classifier_model(training_features_tensor)
-        training_loss = loss_function(prediction_logits, training_labels_tensor)
-        training_loss.backward()
-        optimizer.step()
-
-        should_record_metrics = (
-            epoch_index == 1
-            or epoch_index % model.evaluate_every == 0
-            or epoch_index == model.num_epochs
-        )
-        if should_record_metrics:
-            model.classifier_model.eval()
-            with torch.no_grad():
-                epoch_evaluation_metrics = evaluate_model(
-                    model,
-                    evaluation_dataframe,
-                    feature_column_names,
-                )
-            epoch_evaluation_metrics["epoch"] = float(epoch_index)
-            model.metrics.append(epoch_evaluation_metrics)
-
-
-def evaluate_model(
-    model: Model,
-    evaluation_dataframe: pandas.DataFrame,
-    feature_column_names: list[str],
-) -> dict[str, float]:
-    """Accuracy, precision, recall, F1 (threshold 0.5), Pearson/Spearman on probabilities vs labels."""
-    if model.classifier_model is None or model.scaler is None:
-        raise ValueError("model.classifier_model and model.scaler must be set before evaluate_model")
-    compute_device = next(model.classifier_model.parameters()).device
-    model.classifier_model.eval()
-    evaluation_features, true_labels = extract_feature_matrix_and_labels(
-        evaluation_dataframe, feature_column_names
-    )
-    scaled_evaluation_features = model.scaler.transform(evaluation_features)
-    evaluation_features_tensor = torch.tensor(
-        scaled_evaluation_features, dtype=torch.float32, device=compute_device
-    )
-    with torch.no_grad():
-        prediction_logits = model.classifier_model(evaluation_features_tensor)
-        predicted_probabilities = (
-            torch.sigmoid(prediction_logits).squeeze(1).cpu().numpy()
-        )
-    true_labels_integer = true_labels.astype(int)
+def _scores_from_predictions(
+    true_labels_integer: numpy.ndarray,
+    predicted_probabilities: numpy.ndarray) -> dict[str, float]:
     predicted_labels_integer = (predicted_probabilities >= 0.5).astype(int)
 
-    accuracy_value = float(
-        accuracy_score(true_labels_integer, predicted_labels_integer)
-    )
+    accuracy_value = float(accuracy_score(true_labels_integer, predicted_labels_integer))
     precision_value = float(
         precision_score(true_labels_integer, predicted_labels_integer, zero_division=0)
     )
@@ -224,6 +117,76 @@ def evaluate_model(
     }
 
 
+def _compute_staged_metrics(
+    pipeline,
+    evaluation_features_in_pca_space: numpy.ndarray,
+    true_labels_integer: numpy.ndarray,) -> list[dict[str, float]]:
+    classifier = pipeline.named_steps[CLASSIFIER_STEP]
+    if not hasattr(classifier, "staged_predict_proba"):
+        return []
+
+    metrics_history: list[dict[str, float]] = []
+    classes = list(classifier.classes_)
+    if 1 in classes:
+        positive_class_column_index = classes.index(1)
+    else:
+        positive_class_column_index = -1
+
+    for stage_index, staged_proba in enumerate(
+        classifier.staged_predict_proba(evaluation_features_in_pca_space), start=1):
+        positive_probabilities = staged_proba[:, positive_class_column_index]
+        stage_scores = _scores_from_predictions(true_labels_integer, positive_probabilities)
+        stage_scores["epoch"] = float(stage_index)
+        metrics_history.append(stage_scores)
+    return metrics_history
+
+
+def train_model(
+    model: Model,
+    train_dataframe: pandas.DataFrame,
+    validation_dataframe: pandas.DataFrame | None,
+    feature_column_names: list[str],) -> None:
+    if model.pipeline is None:
+        raise ValueError("model.pipeline must be set before train_model")
+    training_features, training_labels = extract_feature_matrix_and_labels(
+        train_dataframe, feature_column_names
+    )
+    model.pipeline.fit(training_features, training_labels)
+    model.metrics.clear()
+
+    if not model.supports_staged_prediction:
+        return
+
+    evaluation_dataframe = (
+        validation_dataframe if validation_dataframe is not None else train_dataframe
+    )
+    evaluation_features, evaluation_labels = extract_feature_matrix_and_labels(
+        evaluation_dataframe, feature_column_names
+    )
+    scaler = model.pipeline.named_steps["scaler"]
+    pca = model.pipeline.named_steps[PCA_STEP]
+    evaluation_features_in_pca_space = pca.transform(scaler.transform(evaluation_features))
+
+    model.metrics = _compute_staged_metrics(
+        model.pipeline, evaluation_features_in_pca_space, evaluation_labels.astype(int)
+    )
+
+
+def evaluate_model(
+    model: Model,
+    evaluation_dataframe: pandas.DataFrame,
+    feature_column_names: list[str],) -> dict[str, float]:
+    if model.pipeline is None:
+        raise ValueError("model.pipeline must be set before evaluate_model")
+    evaluation_features, true_labels = extract_feature_matrix_and_labels(
+        evaluation_dataframe, feature_column_names
+    )
+    predicted_probabilities = _predicted_probabilities_for_positive_class(
+        model.pipeline, evaluation_features
+    )
+    return _scores_from_predictions(true_labels.astype(int), predicted_probabilities)
+
+
 def _mean_scores(rows: list[dict[str, float]]) -> dict[str, float]:
     if not rows:
         return {}
@@ -231,51 +194,107 @@ def _mean_scores(rows: list[dict[str, float]]) -> dict[str, float]:
     return {key: float(numpy.mean([row[key] for row in rows])) for key in keys}
 
 
+def _instantiate_pipeline_for_template(template: Model) -> None:
+    template.pipeline = build_pipeline(
+        classifier_kind=template.classifier_kind,
+        classifier_kwargs=template.classifier_kwargs,
+        pca_n_components=template.pca_n_components,
+        random_state=DATA_SPLIT_SEED,
+    )
+
+
 def _run_cv_for_model(
     template: Model,
     train_pool: pandas.DataFrame,
     feature_cols: list[str],
-    num_cross_validation_folds: int,
-) -> Model:
+    num_cross_validation_folds: int,) -> Model:
     folds = cross_validation_split(num_cross_validation_folds, train_pool)
     fold_finals: list[dict[str, float]] = []
     best_f1 = -1.0
-    best_state: dict | None = None
-    best_scaler: StandardScaler | None = None
+    best_pipeline = None
     best_metrics_history: list[dict[str, float]] = []
 
-    in_dim = len(feature_cols)
     for fold_index in range(num_cross_validation_folds):
         train_parts = [folds[i] for i in range(num_cross_validation_folds) if i != fold_index]
         train_dataframe = pandas.concat(train_parts, ignore_index=True)
         validation_dataframe = folds[fold_index]
-        m = copy.deepcopy(template)
-        m.classifier_model = BinaryClassifierMLP(in_dim, m.hidden_sizes, m.dropout)
-        m.scaler = StandardScaler()
-        train_model(m, train_dataframe, validation_dataframe, feature_cols)
-        final = evaluate_model(m, validation_dataframe, feature_cols)
+        candidate = copy.deepcopy(template)
+        _instantiate_pipeline_for_template(candidate)
+        train_model(candidate, train_dataframe, validation_dataframe, feature_cols)
+        final = evaluate_model(candidate, validation_dataframe, feature_cols)
         fold_finals.append(final)
         if final["f1"] > best_f1:
             best_f1 = final["f1"]
-            best_state = {kk: vv.cpu().clone() for kk, vv in m.classifier_model.state_dict().items()}
-            best_scaler = copy.deepcopy(m.scaler)
-            best_metrics_history = copy.deepcopy(m.metrics)
+            best_pipeline = copy.deepcopy(candidate.pipeline)
+            best_metrics_history = copy.deepcopy(candidate.metrics)
 
     out = copy.deepcopy(template)
-    out.classifier_model = BinaryClassifierMLP(in_dim, out.hidden_sizes, out.dropout)
-    if best_state is not None:
-        out.classifier_model.load_state_dict(best_state)
-    out.scaler = best_scaler
+    out.pipeline = best_pipeline
     out.metrics = best_metrics_history
     out.final_cv_fold_scores = fold_finals
     out.mean_cv_scores = _mean_scores(fold_finals)
     return out
 
 
+def build_templates(num_features: int) -> list[Model]:
+    pca_components = num_features
+    #Here's the list of models we use
+    templates: list[Model] = [
+        Model(
+            model_name="random_forest_pca",
+            classifier_kind="random_forest",
+            classifier_kwargs={"n_estimators": 200, "max_depth": None, "n_jobs": -1},
+            pca_n_components=pca_components,
+        ),
+        Model(
+            model_name="adaboost_pca",
+            classifier_kind="adaboost",
+            classifier_kwargs={"n_estimators": 200, "learning_rate": 1.0},
+            pca_n_components=pca_components,
+        ),
+        Model(
+            model_name="gradient_boosting_pca",
+            classifier_kind="gradient_boosting",
+            classifier_kwargs={"n_estimators": 200, "learning_rate": 0.1, "max_depth": 3},
+            pca_n_components=pca_components,
+        ),
+        Model(
+            model_name="svm_rbf_pca",
+            classifier_kind="svm",
+            classifier_kwargs={"kernel": "rbf", "C": 1.0, "gamma": "scale"},
+            pca_n_components=pca_components,
+        ),
+    ]
+    return templates
+
+
+def _save_models(
+    cv_trained_models: list[Model],
+    top_final_model: Model,
+    output_directory: str,) -> None:
+
+    models_directory = os.path.join(output_directory, "models")
+    os.makedirs(models_directory, exist_ok=True)
+    for trained_model in cv_trained_models:
+        if trained_model.pipeline is None:
+            continue
+        joblib.dump(
+            trained_model.pipeline,
+            os.path.join(models_directory, f"{trained_model.model_name}_cv_best.joblib"),
+        )
+    if top_final_model.pipeline is not None:
+        joblib.dump(
+            top_final_model.pipeline,
+            os.path.join(models_directory, f"{top_final_model.model_name}_refit_full.joblib"),
+        )
+
+
 def main() -> None:
     feature_csv_file_name = "combined_feature_data.csv"
 
-    parser = argparse.ArgumentParser(description="Train tabular bot classifiers.")
+    parser = argparse.ArgumentParser(
+        description="Train PCA + ensemble/SVM bot classifiers."
+    )
     parser.add_argument(
         "--feature-data-directory",
         type=str,
@@ -301,37 +320,25 @@ def main() -> None:
     cols = feature_columns(data)
     train_pool, test_df = test_split(data)
 
-    templates: list[Model] = [
-        Model("mlp_small_adam", 80, 5, "adam", 1e-3, (32, 16), 0.1),
-        Model("mlp_small_sgd", 80, 5, "sgd", 5e-2, (32, 16), 0.1),
-        Model("mlp_wide_adam", 80, 5, "adam", 1e-3, (128, 64), 0.2),
-        Model("mlp_deep_adam", 100, 5, "adam", 5e-4, (64, 48, 32), 0.15),
-        Model("mlp_tiny_lr", 80, 5, "adam", 1e-4, (48, 24), 0.1),
-        Model("mlp_high_dropout", 80, 5, "adam", 1e-3, (64, 32), 0.35),
-        Model("mlp_large_batch_style", 60, 4, "adam", 2e-3, (96, 48), 0.1),
-        Model("mlp_sgd_deep", 100, 5, "sgd", 1e-1, (72, 36), 0.1),
-    ]
-
-    number_of_models = len(templates)
-    num_cross_validation_folds = max(2, number_of_models)
+    templates = build_templates(num_features=len(cols))
 
     trained: list[Model] = []
     for template in templates:
-        trained.append(
-            _run_cv_for_model(template, train_pool, cols, num_cross_validation_folds)
-        )
+        trained.append(_run_cv_for_model(template, train_pool, cols, NUM_CV_FOLDS))
 
     primary = "f1"
     top = max(trained, key=lambda m: m.mean_cv_scores.get(primary, 0.0))
+
+    #For our top template, we retrain on the full training pool
     top_final = copy.deepcopy(top)
-    in_dim = len(cols)
-    top_final.classifier_model = BinaryClassifierMLP(in_dim, top_final.hidden_sizes, top_final.dropout)
+    _instantiate_pipeline_for_template(top_final)
     train_model(top_final, train_pool, None, cols)
     top_final.test_scores = evaluate_model(top_final, test_df, cols)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = os.path.join(args.visualizations_root_directory, ts)
     os.makedirs(out_dir, exist_ok=True)
+    _save_models(trained, top_final, out_dir)
     Visualizer(random_state=DATA_SPLIT_SEED).produce_all_visualizations(
         trained, out_dir, top_final, train_pool, cols
     )

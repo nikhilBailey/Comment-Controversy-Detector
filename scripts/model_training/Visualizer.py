@@ -1,4 +1,3 @@
-"""Charts for training curves, CV comparison, and encoder inspection."""
 
 from __future__ import annotations
 
@@ -10,9 +9,15 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as pyplot
 import numpy as numpy
 import pandas as pandas
-import torch
+from sklearn.inspection import permutation_importance
 
-from Model import Model, extract_feature_matrix_and_labels
+from Model import (
+    CLASSIFIER_STEP,
+    PCA_STEP,
+    SCALER_STEP,
+    Model,
+    extract_feature_matrix_and_labels,
+)
 
 
 class Visualizer:
@@ -22,33 +27,44 @@ class Visualizer:
     @staticmethod
     def filesystem_safe_directory_name(display_name: str) -> str:
         return "".join(
-            character
-            if character.isalnum() or character in "-_"
-            else "_"
+            character if character.isalnum() or character in "-_" else "_"
             for character in display_name
         )
 
     def produce_model_training_visualizations(self, model: Model, output_path: str) -> None:
-        """
-        Write several charts from model.metrics: per-metric panels, normalized overlay,
-        precision–recall trajectory across epochs, and metric correlation across checkpoints.
-        """
-        if not model.metrics:
-            return
         os.makedirs(output_path, exist_ok=True)
         safe_name = self.filesystem_safe_directory_name(model.model_name)
-        metric_keys = ["accuracy", "precision", "recall", "f1", "pearson", "spearman"]
+        metric_keys = ["accuracy", "precision", "recall", "f1"]
+
+        if not model.metrics:
+            if not model.mean_cv_scores:
+                return
+            figure, axis = pyplot.subplots(figsize=(8, 5))
+            values = [model.mean_cv_scores.get(key, 0.0) for key in metric_keys]
+            axis.bar(metric_keys, values, color="steelblue", edgecolor="black", linewidth=0.4)
+            axis.set_ylim(0.0, 1.02)
+            axis.set_ylabel("score (mean CV)")
+            axis.set_title(f"Final mean CV metrics — {safe_name} (no staged trajectory)")
+            axis.grid(True, axis="y", alpha=0.3)
+            for tick_label in axis.get_xticklabels():
+                tick_label.set_rotation(20)
+                tick_label.set_horizontalalignment("right")
+            figure.tight_layout()
+            figure.savefig(os.path.join(output_path, "final_mean_cv_metrics.png"), dpi=150)
+            pyplot.close(figure)
+            return
+
         epoch_numbers = numpy.array([float(row["epoch"]) for row in model.metrics])
 
-        figure, axes = pyplot.subplots(2, 3, figsize=(12, 7))
+        figure, axes = pyplot.subplots(2, 2, figsize=(10, 7))
         axes = axes.flatten()
         for axis, metric_key in zip(axes, metric_keys):
             metric_values = [row[metric_key] for row in model.metrics]
             axis.plot(epoch_numbers, metric_values, marker="o", markersize=2)
             axis.set_title(metric_key)
-            axis.set_xlabel("epoch")
+            axis.set_xlabel("n_estimators (staged)")
             axis.grid(True, alpha=0.3)
-        figure.suptitle(f"Training metrics — {safe_name}")
+        figure.suptitle(f"Staged training metrics — {safe_name}")
         figure.tight_layout()
         figure.savefig(os.path.join(output_path, "training_metrics.png"), dpi=150)
         pyplot.close(figure)
@@ -63,7 +79,7 @@ class Visualizer:
             else:
                 normalized_values = (raw_values - value_min) / (value_max - value_min)
             axis.plot(epoch_numbers, normalized_values, marker="o", markersize=3, label=metric_key)
-        axis.set_xlabel("epoch")
+        axis.set_xlabel("n_estimators (staged)")
         axis.set_ylabel("min-max normalized score (per metric)")
         axis.set_title(f"All metrics on comparable scale — {safe_name}")
         axis.legend(loc="best", ncol=2, fontsize=8)
@@ -88,11 +104,11 @@ class Visualizer:
         axis.plot(precision_values, recall_values, "k-", alpha=0.35, linewidth=1, zorder=1)
         axis.set_xlabel("precision")
         axis.set_ylabel("recall")
-        axis.set_title(f"Precision vs recall across checkpoints — {safe_name}")
+        axis.set_title(f"Precision vs recall across staged checkpoints — {safe_name}")
         axis.grid(True, alpha=0.3)
         axis.set_xlim(-0.02, 1.02)
         axis.set_ylim(-0.02, 1.02)
-        figure.colorbar(scatter, ax=axis, label="epoch")
+        figure.colorbar(scatter, ax=axis, label="n_estimators")
         figure.tight_layout()
         figure.savefig(os.path.join(output_path, "precision_recall_trajectory.png"), dpi=150)
         pyplot.close(figure)
@@ -110,7 +126,7 @@ class Visualizer:
             axis.set_yticks(numpy.arange(len(metric_keys)))
             axis.set_xticklabels(metric_keys, rotation=45, ha="right")
             axis.set_yticklabels(metric_keys)
-            axis.set_title(f"Metric correlation across logged epochs — {safe_name}")
+            axis.set_title(f"Metric correlation across staged checkpoints — {safe_name}")
             for row_index in range(len(metric_keys)):
                 for column_index in range(len(metric_keys)):
                     cell = correlation_matrix[row_index, column_index]
@@ -136,12 +152,12 @@ class Visualizer:
         bar_width = 0.35
         first_values = [first_row[key] for key in metric_keys]
         last_values = [last_row[key] for key in metric_keys]
-        axis.bar(bar_x - bar_width / 2, first_values, bar_width, label=f"first log (epoch {int(first_row['epoch'])})")
-        axis.bar(bar_x + bar_width / 2, last_values, bar_width, label=f"last log (epoch {int(last_row['epoch'])})")
+        axis.bar(bar_x - bar_width / 2, first_values, bar_width, label=f"first stage (n_est {int(first_row['epoch'])})")
+        axis.bar(bar_x + bar_width / 2, last_values, bar_width, label=f"last stage (n_est {int(last_row['epoch'])})")
         axis.set_xticks(bar_x)
         axis.set_xticklabels(metric_keys, rotation=20, ha="right")
         axis.set_ylabel("score")
-        axis.set_title(f"First vs last logged evaluation — {safe_name}")
+        axis.set_title(f"First vs last staged evaluation — {safe_name}")
         axis.legend()
         axis.grid(True, axis="y", alpha=0.3)
         figure.tight_layout()
@@ -149,21 +165,17 @@ class Visualizer:
         pyplot.close(figure)
 
     def produce_final_model_evaluation_visualizations(self, models: list[Model], output_path: str) -> None:
-        """
-        Several comparison figures from mean CV scores and per-fold CV lists:
-        grouped bars, heatmap, fold spread boxplots, precision-recall scatter, F1 ranking.
-        """
         if not models:
             return
         os.makedirs(output_path, exist_ok=True)
         names = [self.filesystem_safe_directory_name(trained_model.model_name) for trained_model in models]
-        metric_keys = ["accuracy", "precision", "recall", "f1", "pearson", "spearman"]
+        metric_keys = ["accuracy", "precision", "recall", "f1"]
         x_positions = numpy.arange(len(names))
-        bar_width = 0.12
+        bar_width = 0.18
         figure, axis = pyplot.subplots(figsize=(max(10, len(names) * 1.2), 6))
         for index, metric_key in enumerate(metric_keys):
             values = [trained_model.mean_cv_scores.get(metric_key, 0.0) for trained_model in models]
-            axis.bar(x_positions + (index - 2.5) * bar_width, values, bar_width, label=metric_key)
+            axis.bar(x_positions + (index - 1.5) * bar_width, values, bar_width, label=metric_key)
         axis.set_xticks(x_positions)
         axis.set_xticklabels(names, rotation=25, ha="right")
         axis.set_ylabel("score (mean CV)")
@@ -226,7 +238,7 @@ class Visualizer:
         figure.savefig(os.path.join(output_path, "model_comparison_profile_heatmap.png"), dpi=150)
         pyplot.close(figure)
 
-        figure, axes = pyplot.subplots(2, 3, figsize=(14, 9))
+        figure, axes = pyplot.subplots(2, 2, figsize=(11, 8))
         for subplot_axis, metric_key in zip(axes.flatten(), metric_keys):
             per_model_fold_values: list[list[float]] = []
             for trained_model in models:
@@ -316,164 +328,208 @@ class Visualizer:
         figure.savefig(os.path.join(output_path, "model_ranking_mean_f1.png"), dpi=150)
         pyplot.close(figure)
 
-    def produce_encoder_visualizations(
+    def produce_pca_and_classifier_visualizations(
         self,
         model: Model,
         output_path: str,
         sample_df: pandas.DataFrame,
-        feature_cols: list[str],
-    ) -> None:
-        """
-        Plots for the first linear encoder block: weights, bias, norms, feature attribution,
-        activation stats, PCA / optional t-SNE, and an activation heatmap on a sample batch.
-        """
-        if model.classifier_model is None or model.scaler is None:
+        feature_cols: list[str],) -> None:
+        if model.pipeline is None:
             return
         os.makedirs(output_path, exist_ok=True)
-        compute_device = next(model.classifier_model.parameters()).device
-        first_linear_layer = model.classifier_model.layers[0]
-        weight_matrix = first_linear_layer.weight.detach().cpu().numpy()
 
-        figure, axis = pyplot.subplots(figsize=(10, 6))
-        color_mesh = axis.imshow(weight_matrix, aspect="auto", cmap="coolwarm", interpolation="nearest")
-        axis.set_xlabel("input feature index (scaled column order)")
-        axis.set_ylabel("encoder unit index")
-        axis.set_title("Encoder weight matrix (first linear layer)")
-        figure.colorbar(color_mesh, ax=axis)
-        figure.tight_layout()
-        figure.savefig(os.path.join(output_path, "encoder_weights.png"), dpi=150)
-        pyplot.close(figure)
+        pca = model.pipeline.named_steps[PCA_STEP]
+        scaler = model.pipeline.named_steps[SCALER_STEP]
+        classifier = model.pipeline.named_steps[CLASSIFIER_STEP]
 
-        sample_row_count = min(256, len(sample_df))
-        sample_dataframe = sample_df.iloc[:sample_row_count]
-        sample_features, _ = extract_feature_matrix_and_labels(sample_dataframe, feature_cols)
-        scaled_sample_features = model.scaler.transform(sample_features)
-        sample_features_tensor = torch.tensor(
-            scaled_sample_features, dtype=torch.float32, device=compute_device
-        )
-        model.classifier_model.eval()
-        with torch.no_grad():
-            encoder_activations = model.classifier_model.encode(sample_features_tensor).cpu().numpy()
-
-        if first_linear_layer.bias is not None:
-            bias_numpy = first_linear_layer.bias.detach().cpu().numpy()
-            figure, axis = pyplot.subplots(figsize=(10, 4))
-            axis.bar(numpy.arange(len(bias_numpy)), bias_numpy, color="slategray", edgecolor="black", linewidth=0.3)
-            axis.set_xlabel("encoder unit index")
-            axis.set_ylabel("bias")
-            axis.set_title("First-layer encoder biases")
-            axis.grid(True, axis="y", alpha=0.3)
-            figure.tight_layout()
-            figure.savefig(os.path.join(output_path, "encoder_first_layer_bias.png"), dpi=150)
-            pyplot.close(figure)
-
-        row_weight_l2_norms = numpy.linalg.norm(weight_matrix, axis=1)
-        figure, axis = pyplot.subplots(figsize=(10, 4))
-        axis.bar(numpy.arange(len(row_weight_l2_norms)), row_weight_l2_norms, color="teal", edgecolor="black", linewidth=0.3)
-        axis.set_xlabel("encoder unit index")
-        axis.set_ylabel("L2 norm of weight row")
-        axis.set_title("Magnitude of incoming weights per encoder unit")
-        axis.grid(True, axis="y", alpha=0.3)
-        figure.tight_layout()
-        figure.savefig(os.path.join(output_path, "encoder_unit_weight_l2_norms.png"), dpi=150)
-        pyplot.close(figure)
-
-        column_abs_sum_importance = numpy.sum(numpy.abs(weight_matrix), axis=0)
-        figure, axis = pyplot.subplots(figsize=(max(8, len(feature_cols) * 0.45), 5))
+        explained_variance_ratio = numpy.asarray(pca.explained_variance_ratio_)
+        cumulative_explained_variance = numpy.cumsum(explained_variance_ratio)
+        component_indices = numpy.arange(1, len(explained_variance_ratio) + 1)
+        figure, axis = pyplot.subplots(figsize=(9, 5))
         axis.bar(
-            numpy.arange(len(feature_cols)),
-            column_abs_sum_importance,
-            color="coral",
+            component_indices,
+            explained_variance_ratio,
+            color="steelblue",
             edgecolor="black",
             linewidth=0.3,
+            label="per-component",
         )
+        axis_secondary = axis.twinx()
+        axis_secondary.plot(
+            component_indices,
+            cumulative_explained_variance,
+            color="darkorange",
+            marker="o",
+            label="cumulative",
+        )
+        axis_secondary.set_ylim(0.0, 1.02)
+        axis.set_xlabel("PCA component")
+        axis.set_ylabel("explained variance ratio")
+        axis_secondary.set_ylabel("cumulative explained variance")
+        axis.set_title("PCA explained variance (scree)")
+        axis.grid(True, axis="y", alpha=0.3)
+        figure.tight_layout()
+        figure.savefig(os.path.join(output_path, "pca_explained_variance.png"), dpi=150)
+        pyplot.close(figure)
+
+        loadings = numpy.asarray(pca.components_)
+        figure, axis = pyplot.subplots(
+            figsize=(max(8, len(feature_cols) * 0.55), max(4.5, loadings.shape[0] * 0.45))
+        )
+        color_mesh = axis.imshow(loadings, aspect="auto", cmap="coolwarm", interpolation="nearest")
         axis.set_xticks(numpy.arange(len(feature_cols)))
         axis.set_xticklabels(feature_cols, rotation=55, ha="right", fontsize=8)
-        axis.set_ylabel("sum of |weights|")
-        axis.set_title("Input feature attribution proxy (first layer, column L1 mass)")
-        axis.grid(True, axis="y", alpha=0.3)
+        axis.set_yticks(numpy.arange(loadings.shape[0]))
+        axis.set_yticklabels([f"PC{idx + 1}" for idx in range(loadings.shape[0])])
+        axis.set_title("PCA component loadings (rows = components, cols = input features)")
+        figure.colorbar(color_mesh, ax=axis, label="loading")
         figure.tight_layout()
-        figure.savefig(os.path.join(output_path, "encoder_input_feature_abs_weight_mass.png"), dpi=150)
+        figure.savefig(os.path.join(output_path, "pca_component_loadings.png"), dpi=150)
         pyplot.close(figure)
 
-        figure, axis = pyplot.subplots(figsize=(8, 5))
-        axis.hist(encoder_activations.flatten(), bins=40, color="steelblue", edgecolor="white", linewidth=0.4)
-        axis.set_xlabel("ReLU encoder activation value")
-        axis.set_ylabel("count")
-        axis.set_title("Distribution of encoder outputs (sample batch)")
-        axis.grid(True, axis="y", alpha=0.3)
-        figure.tight_layout()
-        figure.savefig(os.path.join(output_path, "encoder_activation_histogram.png"), dpi=150)
-        pyplot.close(figure)
+        sample_row_count = min(512, len(sample_df))
+        sample_dataframe = sample_df.iloc[:sample_row_count]
+        sample_features, sample_labels = extract_feature_matrix_and_labels(sample_dataframe, feature_cols)
+        sample_in_pca_space = pca.transform(scaler.transform(sample_features))
+        if sample_in_pca_space.shape[1] >= 2:
+            figure, axis = pyplot.subplots(figsize=(7, 6))
+            for label_value, color, marker in [(0, "steelblue", "o"), (1, "crimson", "^")]:
+                mask = sample_labels.astype(int) == label_value
+                axis.scatter(
+                    sample_in_pca_space[mask, 0],
+                    sample_in_pca_space[mask, 1],
+                    s=22,
+                    alpha=0.7,
+                    c=color,
+                    marker=marker,
+                    edgecolors="white",
+                    linewidths=0.4,
+                    label=f"label={label_value}",
+                )
+            axis.set_xlabel("PC1")
+            axis.set_ylabel("PC2")
+            axis.set_title("Training-pool sample projected to PC1 × PC2")
+            axis.legend(loc="best")
+            axis.grid(True, alpha=0.3)
+            figure.tight_layout()
+            figure.savefig(os.path.join(output_path, "pca_pc1_pc2_by_label.png"), dpi=150)
+            pyplot.close(figure)
 
-        heatmap_row_count = min(80, encoder_activations.shape[0])
-        figure, axis = pyplot.subplots(figsize=(max(8, weight_matrix.shape[1] * 0.25), 7))
-        activation_slice = encoder_activations[:heatmap_row_count, :]
-        color_mesh = axis.imshow(activation_slice, aspect="auto", cmap="magma", interpolation="nearest")
-        axis.set_xlabel("encoder unit index")
-        axis.set_ylabel("sample row (subset)")
-        axis.set_title("Encoder activations (samples × units)")
-        figure.colorbar(color_mesh, ax=axis, label="activation")
-        figure.tight_layout()
-        figure.savefig(os.path.join(output_path, "encoder_activation_heatmap.png"), dpi=150)
-        pyplot.close(figure)
-
-        mean_activation_per_unit = numpy.mean(encoder_activations, axis=0)
-        std_activation_per_unit = numpy.std(encoder_activations, axis=0)
-        unit_indices = numpy.arange(len(mean_activation_per_unit))
-        figure, axis = pyplot.subplots(figsize=(10, 4))
-        axis.bar(unit_indices, mean_activation_per_unit, yerr=std_activation_per_unit, capsize=2, color="mediumpurple", edgecolor="black", linewidth=0.3, alpha=0.85)
-        axis.set_xlabel("encoder unit index")
-        axis.set_ylabel("mean activation (+/- std)")
-        axis.set_title("Per-unit activation mean on sample (error bars = batch std)")
-        axis.grid(True, axis="y", alpha=0.3)
-        figure.tight_layout()
-        figure.savefig(os.path.join(output_path, "encoder_unit_activation_mean_std.png"), dpi=150)
-        pyplot.close(figure)
-
-        activation_sample_count = encoder_activations.shape[0]
-        hidden_unit_count = encoder_activations.shape[1]
-
-        if hidden_unit_count >= 2 and activation_sample_count >= 2:
+        component_labels = [f"PC{idx + 1}" for idx in range(loadings.shape[0])]
+        component_importance: numpy.ndarray | None = None
+        importance_kind = "permutation"
+        if hasattr(classifier, "feature_importances_"):
+            component_importance = numpy.asarray(classifier.feature_importances_)
+            importance_kind = "native (impurity-based)"
+        else:
             try:
-                from sklearn.decomposition import PCA
+                permutation_result_pca = permutation_importance(
+                    classifier,
+                    sample_in_pca_space,
+                    sample_labels.astype(int),
+                    n_repeats=10,
+                    random_state=self._random_state,
+                    n_jobs=1,
+                )
+                component_importance = numpy.asarray(permutation_result_pca.importances_mean)
+            except Exception:
+                component_importance = None
 
-                embedding_two_d = PCA(n_components=2).fit_transform(encoder_activations)
-                figure, axis = pyplot.subplots(figsize=(7, 6))
-                axis.scatter(embedding_two_d[:, 0], embedding_two_d[:, 1], alpha=0.55, s=16, c="darkblue")
-                axis.set_title("Encoder activations (PCA 2D)")
+        if component_importance is not None and len(component_importance) == len(component_labels):
+            figure, axis = pyplot.subplots(figsize=(max(8, len(component_labels) * 0.45), 5))
+            axis.bar(
+                numpy.arange(len(component_labels)),
+                component_importance,
+                color="coral",
+                edgecolor="black",
+                linewidth=0.3,
+            )
+            axis.set_xticks(numpy.arange(len(component_labels)))
+            axis.set_xticklabels(component_labels, rotation=35, ha="right")
+            axis.set_ylabel("importance")
+            axis.set_title(f"Classifier importance per PCA component ({importance_kind})")
+            axis.grid(True, axis="y", alpha=0.3)
+            figure.tight_layout()
+            figure.savefig(os.path.join(output_path, "classifier_pca_component_importance.png"), dpi=150)
+            pyplot.close(figure)
+
+        if component_importance is not None and len(component_importance) == loadings.shape[0]:
+            attribution_per_input_feature = numpy.abs(loadings).T @ numpy.abs(component_importance)
+            figure, axis = pyplot.subplots(figsize=(max(8, len(feature_cols) * 0.45), 5))
+            axis.bar(
+                numpy.arange(len(feature_cols)),
+                attribution_per_input_feature,
+                color="teal",
+                edgecolor="black",
+                linewidth=0.3,
+            )
+            axis.set_xticks(numpy.arange(len(feature_cols)))
+            axis.set_xticklabels(feature_cols, rotation=55, ha="right", fontsize=8)
+            axis.set_ylabel("|loading| × |component importance|")
+            axis.set_title("Input feature attribution (via PCA loadings × component importance)")
+            axis.grid(True, axis="y", alpha=0.3)
+            figure.tight_layout()
+            figure.savefig(os.path.join(output_path, "classifier_input_feature_attribution.png"), dpi=150)
+            pyplot.close(figure)
+
+        if sample_in_pca_space.shape[1] >= 2:
+            try:
+                from sklearn.base import clone
+
+                two_d_features = sample_in_pca_space[:, :2]
+                two_d_labels = sample_labels.astype(int)
+                two_d_classifier = clone(classifier)
+                two_d_classifier.fit(two_d_features, two_d_labels)
+                grid_axis_one_min = float(two_d_features[:, 0].min()) - 0.5
+                grid_axis_one_max = float(two_d_features[:, 0].max()) + 0.5
+                grid_axis_two_min = float(two_d_features[:, 1].min()) - 0.5
+                grid_axis_two_max = float(two_d_features[:, 1].max()) + 0.5
+                grid_axis_one_values, grid_axis_two_values = numpy.meshgrid(
+                    numpy.linspace(grid_axis_one_min, grid_axis_one_max, 200),
+                    numpy.linspace(grid_axis_two_min, grid_axis_two_max, 200),
+                )
+                grid_points = numpy.column_stack(
+                    [grid_axis_one_values.ravel(), grid_axis_two_values.ravel()]
+                )
+                if hasattr(two_d_classifier, "predict_proba"):
+                    classes = list(two_d_classifier.classes_)
+                    positive_column_index = classes.index(1) if 1 in classes else -1
+                    grid_scores = two_d_classifier.predict_proba(grid_points)[:, positive_column_index]
+                else:
+                    grid_scores = two_d_classifier.predict(grid_points).astype(float)
+                grid_scores = grid_scores.reshape(grid_axis_one_values.shape)
+
+                figure, axis = pyplot.subplots(figsize=(7.5, 6.5))
+                contour = axis.contourf(
+                    grid_axis_one_values,
+                    grid_axis_two_values,
+                    grid_scores,
+                    levels=20,
+                    cmap="coolwarm",
+                    alpha=0.7,
+                )
+                figure.colorbar(contour, ax=axis, label="P(label=1) (2D proxy)")
+                for label_value, color, marker in [(0, "navy", "o"), (1, "darkred", "^")]:
+                    mask = two_d_labels == label_value
+                    axis.scatter(
+                        two_d_features[mask, 0],
+                        two_d_features[mask, 1],
+                        s=18,
+                        alpha=0.8,
+                        c=color,
+                        marker=marker,
+                        edgecolors="white",
+                        linewidths=0.4,
+                        label=f"label={label_value}",
+                    )
                 axis.set_xlabel("PC1")
                 axis.set_ylabel("PC2")
-                axis.grid(True, alpha=0.3)
+                axis.set_title("Decision surface in PC1 × PC2 (2D proxy refit of top classifier)")
+                axis.legend(loc="best")
                 figure.tight_layout()
-                figure.savefig(os.path.join(output_path, "encoder_pca.png"), dpi=150)
+                figure.savefig(os.path.join(output_path, "classifier_decision_surface_pc1_pc2.png"), dpi=150)
                 pyplot.close(figure)
-            except ImportError:
-                pass
-
-        if hidden_unit_count >= 2 and activation_sample_count >= 4:
-            try:
-                from sklearn.manifold import TSNE
-
-                perplexity = float(min(30, max(2, activation_sample_count - 1)))
-                embedding_tsne = TSNE(
-                    n_components=2,
-                    perplexity=perplexity,
-                    init="pca",
-                    random_state=self._random_state,
-                ).fit_transform(encoder_activations)
-                figure, axis = pyplot.subplots(figsize=(7, 6))
-                axis.scatter(embedding_tsne[:, 0], embedding_tsne[:, 1], alpha=0.55, s=16, c="darkgreen")
-                axis.set_title(f"Encoder activations (t-SNE 2D, perplexity={perplexity:.0f})")
-                axis.set_xlabel("t-SNE 1")
-                axis.set_ylabel("t-SNE 2")
-                axis.grid(True, alpha=0.3)
-                figure.tight_layout()
-                figure.savefig(os.path.join(output_path, "encoder_tsne.png"), dpi=150)
-                pyplot.close(figure)
-            except ImportError:
-                pass
-            except ValueError:
+            except Exception:
                 pass
 
     def produce_all_visualizations(
@@ -488,6 +544,8 @@ class Visualizer:
         for m in models:
             sub = os.path.join(per_root, self.filesystem_safe_directory_name(m.model_name))
             self.produce_model_training_visualizations(m, sub)
-        self.produce_final_model_evaluation_visualizations(models, os.path.join(output_dir, "final_comparison"))
+        self.produce_final_model_evaluation_visualizations(
+            models, os.path.join(output_dir, "final_comparison")
+        )
         top_dir = os.path.join(output_dir, "top_model")
-        self.produce_encoder_visualizations(top_model, top_dir, train_pool, feature_cols)
+        self.produce_pca_and_classifier_visualizations(top_model, top_dir, train_pool, feature_cols)

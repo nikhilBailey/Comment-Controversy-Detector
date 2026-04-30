@@ -1,69 +1,90 @@
-"""Tabular classifier network and training-time model container."""
-
 from __future__ import annotations
-
 from dataclasses import dataclass, field
-from typing import Literal
-
+from typing import Any, Literal
 import numpy as numpy
 import pandas as pandas
-import torch
-import torch.nn as nn
-import torch.nn.functional as torch_functional
+from sklearn.decomposition import PCA
+from sklearn.ensemble import (
+    AdaBoostClassifier,
+    GradientBoostingClassifier,
+    RandomForestClassifier,
+)
+from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
 
 LABEL_COL = "is_bot_annotation"
 TEXT_COL = "text"
 
+ClassifierKind = Literal["random_forest", "adaboost", "gradient_boosting", "svm"]
+
+SCALER_STEP = "scaler"
+PCA_STEP = "pca"
+CLASSIFIER_STEP = "classifier"
+
 
 def extract_feature_matrix_and_labels(
     dataframe: pandas.DataFrame,
-    feature_column_names: list[str],
-) -> tuple[numpy.ndarray, numpy.ndarray]:
+    feature_column_names: list[str],) -> tuple[numpy.ndarray, numpy.ndarray]:
     feature_matrix = dataframe[feature_column_names].to_numpy(dtype=numpy.float64)
-    labels = dataframe[LABEL_COL].to_numpy(dtype=numpy.float64)
+    labels = dataframe[LABEL_COL].to_numpy(dtype=numpy.int64)
     return feature_matrix, labels
 
 
-class BinaryClassifierMLP(nn.Module):
-    """MLP on numeric feature vectors; single logit for binary labels. First hidden block is the 'encoder' for viz."""
+def build_classifier(
+    classifier_kind: ClassifierKind,
+    classifier_kwargs: dict[str, Any],
+    random_state: int,
+) -> Any:
+    merged_kwargs = dict(classifier_kwargs)
+    if classifier_kind == "random_forest":
+        merged_kwargs.setdefault("random_state", random_state)
+        return RandomForestClassifier(**merged_kwargs)
+    if classifier_kind == "adaboost":
+        merged_kwargs.setdefault("random_state", random_state)
+        return AdaBoostClassifier(**merged_kwargs)
+    if classifier_kind == "gradient_boosting":
+        merged_kwargs.setdefault("random_state", random_state)
+        return GradientBoostingClassifier(**merged_kwargs)
+    if classifier_kind == "svm":
+        merged_kwargs.setdefault("probability", True)
+        merged_kwargs.setdefault("random_state", random_state)
+        return SVC(**merged_kwargs)
+    raise ValueError(f"Unknown classifier_kind {classifier_kind!r}")
 
-    def __init__(self, in_dim: int, hidden_sizes: tuple[int, ...], dropout: float) -> None:
-        super().__init__()
-        if not hidden_sizes:
-            raise ValueError("hidden_sizes must be non-empty")
-        sizes = (in_dim,) + hidden_sizes
-        self.layers = nn.ModuleList()
-        for i in range(len(sizes) - 1):
-            self.layers.append(nn.Linear(sizes[i], sizes[i + 1]))
-        self.dropout = nn.Dropout(dropout)
-        self.final = nn.Linear(sizes[-1], 1)
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        activations = inputs
-        for linear_layer in self.layers:
-            activations = linear_layer(activations)
-            activations = torch_functional.relu(activations)
-            activations = self.dropout(activations)
-        return self.final(activations)
-
-    def encode(self, inputs: torch.Tensor) -> torch.Tensor:
-        encoded = self.layers[0](inputs)
-        return torch_functional.relu(encoded)
+def build_pipeline(
+    classifier_kind: ClassifierKind,
+    classifier_kwargs: dict[str, Any],
+    pca_n_components: int,
+    random_state: int,
+) -> Pipeline:
+    #We use standard scaler then PCA and then one of the four classifiers we chose
+    classifier = build_classifier(classifier_kind, classifier_kwargs, random_state)
+    return Pipeline(
+        steps=[
+            (SCALER_STEP, StandardScaler()),
+            (PCA_STEP, PCA(n_components=pca_n_components, random_state=random_state)),
+            (CLASSIFIER_STEP, classifier),
+        ]
+    )
 
 
 @dataclass
 class Model:
+    #This hold a single one of our model templates
+
     model_name: str
-    num_epochs: int
-    evaluate_every: int
-    optimization_function: Literal["adam", "sgd"]
-    learning_rate: float
-    hidden_sizes: tuple[int, ...]
-    dropout: float
-    classifier_model: BinaryClassifierMLP | None = None
-    scaler: StandardScaler | None = None
+    classifier_kind: ClassifierKind
+    classifier_kwargs: dict[str, Any]
+    pca_n_components: int
+    pipeline: Pipeline | None = None
     metrics: list[dict[str, float]] = field(default_factory=list)
     final_cv_fold_scores: list[dict[str, float]] = field(default_factory=list)
     mean_cv_scores: dict[str, float] = field(default_factory=dict)
     test_scores: dict[str, float] = field(default_factory=dict)
+
+    #This is for the ensemble methods
+    @property
+    def supports_staged_prediction(self) -> bool:
+        return self.classifier_kind in ("gradient_boosting", "adaboost")
